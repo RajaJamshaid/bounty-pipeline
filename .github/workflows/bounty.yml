@@ -5,10 +5,14 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
 jobs:
   run-arbitrage:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -23,19 +27,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Setup GitHub CLI
-        run: |
-          echo "${{ secrets.GH_PAT }}" | gh auth login --with-token
-
-      - name: Step 1 - Run Bounty Sniper (bot.py)
+      - name: Run Bounty Discovery & Resolution Engine
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python bot.py
-
-      - name: Step 2 - Run AI Autonomous Solver (solver.py)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
           python solver.py
