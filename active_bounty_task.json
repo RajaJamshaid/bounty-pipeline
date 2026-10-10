@@ -1,14 +1,14 @@
 {
-  "repo": "microsoft/winget-pkgs",
-  "issue_number": 448429,
-  "title": "[Package Request]: hpsdr-rs",
-  "author": "AsciiWolf",
-  "amount_usd": 0,
-  "url": "https://github.com/microsoft/winget-pkgs/issues/448429",
-  "description": "### How can we help?\n\nI would like someone else to build the manifest.\n\n### Please read and ensure the following\n\n- [x] The installer meets the above requirements\n\n### Please provide the following information\n\nDownload Page Url: https://github.com/g0orx/hpsdr-rs/releases\nPublisher: John Melton\nPackage Name: hpsdr-rs\nDescription: Desktop client for openHPSDR Protocol 1/2 SDR radios.\nPackage Version: 0.7.0\nInstaller Url: https://github.com/g0orx/hpsdr-rs/releases/download/v0.7.0/hpsdr-rs-0.7.0-x86_64.msi",
+  "repo": "appsweb/featweb",
+  "issue_number": 1,
+  "title": "Modernize web GUI and add agent visualizer",
+  "author": "BountyHub User",
+  "amount_usd": 100,
+  "url": "https://www.bountyhub.dev/en/bounty/view/a75a0675-bd38-455b-ba64-d64e9644de0f/featweb-modernize-web-gui-and-add-agent-visualizer-appsweb",
+  "description": "Modernize web GUI and add agent visualizer appsweb bounty task.",
   "labels": [
-    "Help-Wanted",
-    "Package-Request",
-    "Needs-Triage"
+    "bounty",
+    "enhancement",
+    "frontend"
   ]
 }
