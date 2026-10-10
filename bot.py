@@ -3,6 +3,9 @@ import subprocess
 import os
 import sys
 
+os.system('git config --global user.name "RajaJamshaid"')
+os.system('git config --global user.email "rajajamshaid22@gmail.com"')
+
 def load_task():
     if not os.path.exists("active_bounty_task.json"):
         print("ℹ️ No active task found. Skipping solver.")
