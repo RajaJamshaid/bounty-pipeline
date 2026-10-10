@@ -1,0 +1,41 @@
+name: Autonomous Agency Arbitrage Engine
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-arbitrage:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Setup GitHub CLI
+        run: |
+          echo "${{ secrets.GH_PAT }}" | gh auth login --with-token
+
+      - name: Step 1 - Run Bounty Sniper (bot.py)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          python bot.py
+
+      - name: Step 2 - Run AI Autonomous Solver (solver.py)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python solver.py
