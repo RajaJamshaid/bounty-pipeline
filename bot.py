@@ -31,19 +31,25 @@ def send_telegram_msg(text):
         print(f"❌ Failed to send Telegram notification: {e}")
 
 def load_task():
-    if not os.path.exists("active_bounty_task.json"):
-        print("ℹ️ No active task found.")
-        sys.exit(0)
-    with open("active_bounty_task.json", "r") as f:
+    # Look for active task file in parent or current directory
+    task_path = "active_bounty_task.json"
+    if not os.path.exists(task_path):
+        # If running from root while inside cloned repo or vice versa
+        if os.path.exists("../active_bounty_task.json"):
+            task_path = "../active_bounty_task.json"
+        else:
+            print("ℹ️ No active task found.")
+            sys.exit(0)
+            
+    with open(task_path, "r") as f:
         return json.load(f)
 
 def run_tests():
     """ Runs project tests to verify if build is GREEN """
     print("🧪 Running local test suite...")
-    # Add project specific test commands (e.g. npm test or pytest)
     if os.path.exists("package.json"):
         res = subprocess.run(["npm", "test"], capture_output=True, text=True)
-    elif os.path.exists("pytest.ini") or os.path.exists("requirements.txt"):
+    elif os.path.exists("pytest.ini") or os.path.exists("requirements.txt") or os.path.exists("setup.py"):
         res = subprocess.run(["pytest"], capture_output=True, text=True)
     else:
         return True, "No standard test framework detected (Skipped tests)."
@@ -55,20 +61,35 @@ def run_tests():
 
 def main():
     task = load_task()
-    repo = task.get('repo')
+    repo = task.get('repo') # e.g. "appsweb/featweb"
     issue_num = task.get('issue_number')
     title = task.get('title')
     amount = task.get('amount_usd', 0)
     url = task.get('url', '')
 
     print(f"\n🚀 PROCESSING BOUNTY: {title} (${amount})")
+
+    # 1. Clone target repository if not already cloned
+    repo_name = repo.split('/')[-1] # "featweb"
     
-    # 1. Test Verification
+    # Go to root workspace if we are inside a subdirectory
+    if not os.path.exists("active_bounty_task.json") and os.path.exists("../active_bounty_task.json"):
+        os.chdir("..")
+
+    if not os.path.exists(repo_name):
+        print(f"📥 Cloning repository: https://github.com/{repo}.git")
+        subprocess.run(["git", "clone", f"https://github.com/{repo}.git"])
+
+    # Change working directory into cloned repository for testing
+    if os.path.exists(repo_name):
+        os.chdir(repo_name)
+
+    # 2. Test Verification inside cloned repo
     test_passed, test_log = run_tests()
     
     status_icon = "🟢 GREEN" if test_passed else "🔴 RED"
     
-    # 2. Build Summary Message for Telegram Review
+    # 3. Build Summary Message for Telegram
     msg = (
         f"🎯 *NEW BOUNTY READY FOR HUMAN REVIEW*\n\n"
         f"📌 *Repo:* `{repo}`\n"
@@ -81,7 +102,7 @@ def main():
         f"👉 *Action Needed:* Code review karein aur GitHub par PR submit karein!"
     )
 
-    # 3. Send Notification to Telegram
+    # 4. Send Notification to Telegram
     send_telegram_msg(msg)
 
 if __name__ == "__main__":
