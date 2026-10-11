@@ -38,6 +38,8 @@ INSTALL_TIMEOUT = 600
 TEST_TIMEOUT = 900
 TG_LIMIT = 4000  # Telegram hard limit is 4096 chars
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+
 LOGS = []  # human-readable task log
 
 
@@ -49,8 +51,8 @@ def log(msg):
 
 
 def mask(text):
-    """Never leak tokens into logs or Telegram."""
-    text = text or ""
+    """Strip terminal colour codes and never leak tokens into logs or Telegram."""
+    text = ANSI_RE.sub("", text or "")
     for secret in (GH_TOKEN, TG_TOKEN):
         if secret:
             text = text.replace(secret, "***")
@@ -70,6 +72,8 @@ def run(cmd, cwd=None, timeout=300, env_extra=None):
     env["GIT_TERMINAL_PROMPT"] = "0"  # never prompt for credentials
     env["GCM_INTERACTIVE"] = "never"
     env["CI"] = "true"
+    env["NO_COLOR"] = "1"      # plain-text output (no ANSI colours)
+    env["FORCE_COLOR"] = "0"
     if env_extra:
         env.update(env_extra)
     try:
