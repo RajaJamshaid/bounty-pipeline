@@ -11,4 +11,5 @@ database_name = "bounty-discovery"
 database_id = "5b94bed2-1ce3-4a54-a7c7-55491645019b"
 
 [vars]
-MAX_AGE_HOURS = "6"
+# TEMP for the Telegram test; set back to "6" afterwards
+MAX_AGE_HOURS = "48"
