@@ -3,7 +3,7 @@
 Human-in-the-Loop bounty bot.
 
 Flow: read active_bounty_task.json -> clone target repo (token auth, never
-prompts) -> run tests (npm test / pytest) -> send review report to Telegram.
+prompts) -> run tests (npm/pnpm/yarn test, pytest) -> send review report to Telegram.
 
 Env vars:
   GH_PAT or GITHUB_TOKEN   token used for git clone (GH_PAT wins)
@@ -205,23 +205,66 @@ def detect_and_test(repo_dir):
     return ("GREEN" if ok else "RED"), summary, output
 
 
+def node_package_manager(repo_dir):
+    if (repo_dir / "pnpm-lock.yaml").exists() or (repo_dir / "pnpm-workspace.yaml").exists():
+        return "pnpm"
+    if (repo_dir / "yarn.lock").exists():
+        return "yarn"
+    return "npm"
+
+
+def ensure_tool(name):
+    """Make sure pnpm/yarn exist on the runner. Returns True if usable."""
+    code, _ = run([name, "--version"], timeout=60)
+    if code == 0:
+        return True
+    log(f"Installing {name}")
+    run(["corepack", "enable"], timeout=120)
+    code, _ = run([name, "--version"], timeout=60)
+    if code == 0:
+        return True
+    run(["npm", "install", "-g", name], timeout=300)
+    code, _ = run([name, "--version"], timeout=60)
+    return code == 0
+
+
 def run_node(repo_dir):
+    pm = node_package_manager(repo_dir)
+    label = f"{pm} test"
     try:
         pkg = json.loads((repo_dir / "package.json").read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         pkg = {}
     if "test" not in (pkg.get("scripts") or {}):
         log("Node: no 'test' script in package.json")
-        return "npm test", False, "package.json has no 'test' script."
+        return label, False, "package.json has no 'test' script."
 
-    installer = ["npm", "ci"] if (repo_dir / "package-lock.json").exists() else ["npm", "install"]
-    log(f"Node: {' '.join(installer)}")
-    code, out = run(installer + ["--no-audit", "--no-fund"], cwd=repo_dir, timeout=INSTALL_TIMEOUT)
-    if code != 0:
-        return "npm test", False, f"Install failed:\n{tail(out, 1200)}"
-    log("Node: npm test")
-    code, out = run(["npm", "test"], cwd=repo_dir, timeout=TEST_TIMEOUT)
-    return "npm test", code == 0, out
+    if pm != "npm" and not ensure_tool(pm):
+        return label, False, f"Could not install {pm} on the runner."
+
+    if pm == "pnpm":
+        installers = [["pnpm", "install", "--frozen-lockfile"], ["pnpm", "install", "--no-frozen-lockfile"]]
+    elif pm == "yarn":
+        installers = [["yarn", "install", "--frozen-lockfile"], ["yarn", "install"]]
+    elif (repo_dir / "package-lock.json").exists():
+        installers = [["npm", "ci", "--no-audit", "--no-fund"], ["npm", "install", "--no-audit", "--no-fund"]]
+    else:
+        installers = [["npm", "install", "--no-audit", "--no-fund"]]
+
+    out = ""
+    installed = False
+    for cmd in installers:
+        log(f"Node: {' '.join(cmd)}")
+        code, out = run(cmd, cwd=repo_dir, timeout=INSTALL_TIMEOUT)
+        if code == 0:
+            installed = True
+            break
+    if not installed:
+        return label, False, f"Install failed:\n{tail(out, 1200)}"
+
+    log(f"Node: {label}")
+    code, out = run([pm, "test"], cwd=repo_dir, timeout=TEST_TIMEOUT)
+    return label, code == 0, out
 
 
 def run_python(repo_dir):
