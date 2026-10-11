@@ -24,7 +24,16 @@ export default {
     if (u.pathname === "/debug/algora") {
       try {
         const items = await fetchAlgora();
-        return Response.json({ ok: true, count: items.length, sample: items.slice(0, 2) });
+        const sample = items.slice(0, 3).map((b) => ({
+          id: b.id,
+          reward: b.reward_formatted,
+          status: b.status,
+          created_at: b.created_at,
+          org: b.org?.handle,
+          repo: `${b.task?.repo_owner}/${b.task?.repo_name}#${b.task?.number}`,
+          url: b.task?.url,
+        }));
+        return Response.json({ ok: true, count: items.length, sample });
       } catch (e) {
         return Response.json({ ok: false, error: e.message }, { status: 502 });
       }
@@ -135,13 +144,14 @@ function extractAmount(it) {
 }
 
 // ------------------------------------------------------------------ Algora
-// Algora's public (legacy tRPC) endpoint. The response shape is not documented,
-// so we accept the common tRPC / plain shapes and fail safely.
+// Algora's public (legacy tRPC) endpoint. It replies with a one-element array:
+// [ { result: { data: { json: { items: [...], next_cursor } } } } ]
+// and accepts either the batch form or plain query params (status, org, limit).
 async function fetchAlgora() {
-  const params = { limit: 50, status: "active" };
+  const batchInput = encodeURIComponent(JSON.stringify({ 0: { json: { status: "open", limit: 50 } } }));
   const attempts = [
-    `${ALGORA_URL}?input=${encodeURIComponent(JSON.stringify({ json: params }))}`,
-    `${ALGORA_URL}?input=${encodeURIComponent(JSON.stringify(params))}`,
+    `${ALGORA_URL}?batch=1&input=${batchInput}`,
+    `${ALGORA_URL}?status=open&limit=50`,
   ];
   let lastErr = "no response";
   for (const url of attempts) {
@@ -154,8 +164,15 @@ async function fetchAlgora() {
         continue;
       }
       const data = await res.json();
-      const body = data?.result?.data?.json ?? data?.result?.data ?? data;
-      if (Array.isArray(body?.items)) return body.items;
+      const first = Array.isArray(data) ? data[0] : data;
+      const body = first?.result?.data?.json ?? first?.result?.data ?? first;
+      if (Array.isArray(body?.items)) {
+        if (body.items.length) {
+          return [...body.items].sort((a, b) => Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0));
+        }
+        lastErr = "empty list";
+        continue;
+      }
       lastErr = "unexpected response shape";
     } catch (e) {
       lastErr = e.message;
@@ -166,9 +183,10 @@ async function fetchAlgora() {
 
 function algoraAmount(b) {
   if (b.reward_formatted) return String(b.reward_formatted);
-  if (typeof b.amount === "number") {
-    const cur = b.currency || "USD";
-    const major = (b.amount / 100).toLocaleString("en-US");
+  const r = b.reward || {};
+  if (typeof r.amount === "number") {
+    const cur = r.currency || "USD";
+    const major = (r.amount / 100).toLocaleString("en-US");
     return cur === "USD" ? `$${major}` : `${major} ${cur}`;
   }
   return null;
@@ -185,7 +203,7 @@ async function pollAlgora(env, maxAgeMs, budget) {
 
   for (const b of items) {
     const task = b.task || {};
-    const url = task.html_url || task.url;
+    const url = task.url || task.source?.data?.html_url || task.html_url;
     if (!b.id || !url) continue;
 
     const repo = task.repo_owner && task.repo_name ? `${task.repo_owner}/${task.repo_name}` : task.repo_name || "";
