@@ -1,10 +1,12 @@
 // Phase 1: 24/7 bounty discovery. Runs every minute (Cloudflare cron),
 // searches GitHub for bounty-labelled issues, dedupes in D1, alerts Telegram.
+// Triage: `-linked:pr` skips issues that already have a linked pull request
+// (someone is already working on them), so alerts are only for open races.
 
 const QUERIES = [
-  'label:"💎 Bounty" state:open is:issue no:assignee',
-  'label:bounty state:open is:issue no:assignee',
-  'label:bounties state:open is:issue no:assignee',
+  'label:"💎 Bounty" state:open is:issue no:assignee -linked:pr',
+  'label:bounty state:open is:issue no:assignee -linked:pr',
+  'label:bounties state:open is:issue no:assignee -linked:pr',
 ];
 
 const MAX_ALERTS_PER_RUN = 10;
@@ -95,6 +97,7 @@ async function notify(env, { repo, it, amount }) {
     `💰 ${amount || "amount not found"}`,
     labels ? `🏷 ${labels}` : "",
     `💬 Comments: ${it.comments}`,
+    "✅ No linked PR yet",
     `🕐 Created: ${it.created_at}`,
   ].filter(Boolean).join("\n");
 
