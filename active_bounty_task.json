@@ -1,11 +1,12 @@
 {
-  "repo": "appsweb/featweb",
-  "issue_number": 1,
-  "title": "Modernize web GUI and add agent visualizer",
-  "author": "BountyHub User",
-  "amount_usd": 100,
+  "repo": "romankurnovskii/etemaro",
+  "issue_number": 342,
+  "title": "feat(web): modernize Web GUI and add Agent Visualizer (apps/web)",
+  "author": "romankurnovskii",
+  "amount_usd": 10,
   "url": "https://www.bountyhub.dev/en/bounty/view/a75a0675-bd38-455b-ba64-d64e9644de0f/featweb-modernize-web-gui-and-add-agent-visualizer-appsweb",
-  "description": "Modernize web GUI and add agent visualizer appsweb bounty task.",
+  "issue_url": "https://github.com/romankurnovskii/etemaro/issues/342",
+  "description": "Improve and modernize the web GUI in apps/web (minimalist, engineering-first operator console for the Etemaro CLI daemon). Follow the Etemaro Brand & Identity Guidelines and add an Agent Visualizer module to inspect, monitor and manage active agents and strategies in real time. Creator note: good to have a screenshot in the PR. Policy: fully AI-generated PRs are not accepted; AI may assist but the submission must reflect your own understanding and meaningful human contribution.",
   "labels": [
     "bounty",
     "enhancement",
