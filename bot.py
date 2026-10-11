@@ -30,37 +30,23 @@ def send_telegram_msg(text):
     except Exception as e:
         print(f"❌ Failed to send Telegram notification: {e}")
 
-def load_task():
-    # Look for active task file in parent or current directory
-    task_path = "active_bounty_task.json"
+def main():
+    # Root workspace path save kar lein
+    root_dir = os.path.abspath(os.getcwd())
+    task_path = os.path.join(root_dir, "active_bounty_task.json")
+    
     if not os.path.exists(task_path):
-        # If running from root while inside cloned repo or vice versa
-        if os.path.exists("../active_bounty_task.json"):
-            task_path = "../active_bounty_task.json"
+        # Try finding in parent directory if triggered differently
+        parent_task = os.path.join(os.path.dirname(root_dir), "active_bounty_task.json")
+        if os.path.exists(parent_task):
+            task_path = parent_task
         else:
             print("ℹ️ No active task found.")
             sys.exit(0)
-            
+
     with open(task_path, "r") as f:
-        return json.load(f)
+        task = json.load(f)
 
-def run_tests():
-    """ Runs project tests to verify if build is GREEN """
-    print("🧪 Running local test suite...")
-    if os.path.exists("package.json"):
-        res = subprocess.run(["npm", "test"], capture_output=True, text=True)
-    elif os.path.exists("pytest.ini") or os.path.exists("requirements.txt") or os.path.exists("setup.py"):
-        res = subprocess.run(["pytest"], capture_output=True, text=True)
-    else:
-        return True, "No standard test framework detected (Skipped tests)."
-
-    if res.returncode == 0:
-        return True, res.stdout[:500]
-    else:
-        return False, res.stderr[:500]
-
-def main():
-    task = load_task()
     repo = task.get('repo') # e.g. "appsweb/featweb"
     issue_num = task.get('issue_number')
     title = task.get('title')
@@ -69,27 +55,40 @@ def main():
 
     print(f"\n🚀 PROCESSING BOUNTY: {title} (${amount})")
 
-    # 1. Clone target repository if not already cloned
     repo_name = repo.split('/')[-1] # "featweb"
+    target_repo_path = os.path.join(root_dir, repo_name)
+
+    # 1. Clone or Update Target Repository safely
+    if not os.path.exists(target_repo_path):
+        print(f"📥 Cloning repository: https://github.com/{repo}.git into {target_repo_path}")
+        clone_res = subprocess.run(["git", "clone", f"https://github.com/{repo}.git", target_repo_path], capture_output=True, text=True)
+        if clone_res.returncode != 0:
+            print(f"❌ Git clone failed: {clone_res.stderr}")
     
-    # Go to root workspace if we are inside a subdirectory
-    if not os.path.exists("active_bounty_task.json") and os.path.exists("../active_bounty_task.json"):
-        os.chdir("..")
+    # 2. Change working directory safely to target repo
+    if os.path.exists(target_repo_path):
+        os.chdir(target_repo_path)
+    else:
+        print(f"❌ Target directory {target_repo_path} does not exist!")
+        sys.exit(1)
 
-    if not os.path.exists(repo_name):
-        print(f"📥 Cloning repository: https://github.com/{repo}.git")
-        subprocess.run(["git", "clone", f"https://github.com/{repo}.git"])
+    # 3. Run Tests
+    print("🧪 Running local test suite...")
+    test_log = "No standard test framework detected (Skipped tests)."
+    test_passed = True
 
-    # Change working directory into cloned repository for testing
-    if os.path.exists(repo_name):
-        os.chdir(repo_name)
+    if os.path.exists("package.json"):
+        res = subprocess.run(["npm", "test"], capture_output=True, text=True)
+        test_passed = (res.returncode == 0)
+        test_log = res.stdout[:500] if test_passed else res.stderr[:500]
+    elif os.path.exists("pytest.ini") or os.path.exists("requirements.txt") or os.path.exists("setup.py"):
+        res = subprocess.run(["pytest"], capture_output=True, text=True)
+        test_passed = (res.returncode == 0)
+        test_log = res.stdout[:500] if test_passed else res.stderr[:500]
 
-    # 2. Test Verification inside cloned repo
-    test_passed, test_log = run_tests()
-    
     status_icon = "🟢 GREEN" if test_passed else "🔴 RED"
-    
-    # 3. Build Summary Message for Telegram
+
+    # 4. Build Telegram Notification
     msg = (
         f"🎯 *NEW BOUNTY READY FOR HUMAN REVIEW*\n\n"
         f"📌 *Repo:* `{repo}`\n"
@@ -102,8 +101,9 @@ def main():
         f"👉 *Action Needed:* Code review karein aur GitHub par PR submit karein!"
     )
 
-    # 4. Send Notification to Telegram
+    # 5. Send Notification
     send_telegram_msg(msg)
+    print("✨ Pipeline execution finished successfully.")
 
 if __name__ == "__main__":
     main()
