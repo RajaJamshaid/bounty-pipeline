@@ -1,0 +1,14 @@
+name = "bounty-discovery"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bounty-discovery"
+database_id = "5b94bed2-1ce3-4a54-a7c7-55491645019b"
+
+[vars]
+MAX_AGE_HOURS = "6"
