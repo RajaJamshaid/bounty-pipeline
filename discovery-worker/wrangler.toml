@@ -22,5 +22,6 @@ ALERT_UNKNOWN_AMOUNT = "true"
 MAX_FILES = "12"
 # AI feasibility filter: only alert when the model scores the issue >= MIN_AI_SCORE (0-10)
 MIN_AI_SCORE = "6"
-# Free models (no credits needed). Comma-separated: the next one is tried if one fails.
-TRIAGE_MODEL = "openai/gpt-oss-120b:free,openrouter/free"
+# "auto" = look up the currently free OpenRouter models and use the best few.
+# Or a comma-separated list of model ids; the next one is tried if one fails.
+TRIAGE_MODEL = "auto"

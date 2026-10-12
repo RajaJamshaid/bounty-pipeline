@@ -213,10 +213,52 @@ Also report the maintainers' stance on AI-written code if the issue text states 
 Reply with ONLY a JSON object:
 {"score": <0-10 integer>, "effort_hours": <number>, "est_files": <integer, files likely to change>, "verdict": "solvable"|"borderline"|"skip", "ai_policy": "forbids"|"allows"|"unknown", "reason": "<max 140 chars>"}`;
 
-// TRIAGE_MODEL may be a comma-separated list; the next one is tried when a model fails.
-function triageModels(env) {
-  return (env.TRIAGE_MODEL || "openai/gpt-oss-120b:free,openrouter/free")
-    .split(",").map((m) => m.trim()).filter(Boolean);
+// TRIAGE_MODEL = "auto" (default): look up the currently free OpenRouter models and
+// try the best few in turn. Or set a comma-separated list of model ids yourself.
+// The free-models router (openrouter/free) is NOT used: it can pick any free model,
+// including safety classifiers that cannot answer our JSON prompt.
+let freeCache = { at: 0, list: [] };
+
+// Free models we trust for this task, best first. Others are used after these.
+const MODEL_PREFS = [
+  /devstral/i, /qwen3.*coder/i, /glm-?(4\.[5-9]|5)/i, /deepseek.*(chimera|r1|v3)/i,
+  /llama-3\.3-70b/i, /gemma-3-27b/i, /mimo/i, /kimi/i, /nemotron.*(super|nano)/i, /mistral/i, /qwen3/i,
+];
+const MODEL_BAD = /safety|guard|moderat|embed|rerank|vision|-vl\b|ocr|image|audio|whisper|tts|uncensored|\b(1|2|3|4)b\b/i;
+
+async function freeModels() {
+  if (freeCache.list.length && Date.now() - freeCache.at < 3600e3) return freeCache.list;
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/models", { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`models ${res.status}`);
+    const data = (await res.json()).data || [];
+    const rank = (m) => {
+      const i = MODEL_PREFS.findIndex((re) => re.test(m.id));
+      return i === -1 ? 99 : i;
+    };
+    const list = data
+      .filter((m) => {
+        if (m.id.startsWith("openrouter/")) return false;
+        const free = m.pricing && Number(m.pricing.prompt) === 0 && Number(m.pricing.completion) === 0;
+        const textIn = (m.architecture?.input_modalities || ["text"]).includes("text");
+        const textOut = (m.architecture?.output_modalities || ["text"]).includes("text");
+        return free && textIn && textOut && (m.context_length || 0) >= 16000 && !MODEL_BAD.test(`${m.id} ${m.name || ""}`);
+      })
+      .sort((x, y) => rank(x) - rank(y) || (y.context_length || 0) - (x.context_length || 0))
+      .slice(0, 4)
+      .map((m) => m.id);
+    if (list.length) freeCache = { at: Date.now(), list };
+    return list;
+  } catch (e) {
+    console.error(`free model lookup failed: ${e.message}`);
+    return freeCache.list; // stale list is better than nothing
+  }
+}
+
+async function triageModels(env) {
+  const set = (env.TRIAGE_MODEL || "auto").trim();
+  if (set && set !== "auto") return set.split(",").map((m) => m.trim()).filter(Boolean);
+  return freeModels();
 }
 
 async function openRouter(env, model, body) {
@@ -245,7 +287,7 @@ async function aiTriage(env, it, repo) {
   ].join("\n");
 
   let lastErr = "no model configured";
-  for (const model of triageModels(env)) {
+  for (const model of await triageModels(env)) {
     try {
       const res = await openRouter(env, model, {
         max_tokens: 1500,
@@ -276,7 +318,11 @@ async function debugAi(env) {
     return Response.json({ ok: false, error: "OPENROUTER_API_KEY secret is not set on the worker" }, { status: 500 });
   }
   const results = [];
-  for (const model of triageModels(env)) {
+  const models = await triageModels(env);
+  if (!models.length) {
+    return Response.json({ ok: false, error: "no free model found (OpenRouter model list unavailable?)" }, { status: 502 });
+  }
+  for (const model of models) {
     try {
       const res = await openRouter(env, model, {
         max_tokens: 300,
