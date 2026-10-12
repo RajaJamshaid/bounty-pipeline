@@ -19,6 +19,7 @@ const SOURCES = [
 
 const MAX_ALERTS_PER_RUN = 10;
 const MAX_AI_CALLS_PER_RUN = 6;
+const MAX_BRIEFS_PER_RUN = 3;
 
 export default {
   async scheduled(_event, env, ctx) {
@@ -44,6 +45,7 @@ async function poll(env) {
   const minScore = Number(env.MIN_AI_SCORE || 6);
   let alerts = 0;
   let aiCalls = 0;
+  let briefs = 0;
   let failed = 0;
 
   for (const src of SOURCES) {
@@ -120,6 +122,24 @@ async function poll(env) {
         console.error(`telegram failed: ${e.message}`);
         // forget it so the next minute retries
         await env.DB.prepare("DELETE FROM seen WHERE issue_id = ?").bind(it.id).run();
+        continue;
+      }
+
+      // Send a brief (requirements + repo rules + prompt for claude.ai + PR checklist).
+      // A failure here never affects the alert above.
+      if (briefs < MAX_BRIEFS_PER_RUN) {
+        briefs++;
+        try {
+          const brief = await buildBrief(env, it, repo, amount, ai);
+          await sendDocument(
+            env,
+            `bounty-${repo.replace("/", "_")}-${it.number}.md`,
+            brief,
+            "📎 Brief: requirements, repo rules, a ready prompt for claude.ai and a PR checklist. Review and adapt everything yourself."
+          );
+        } catch (e) {
+          console.error(`brief failed: ${e.message}`);
+        }
       }
     }
   }
@@ -224,6 +244,123 @@ function parseTriage(text) {
   } catch (_e) {
     return null;
   }
+}
+
+// ------------------------------------------------------------ Brief
+async function ghText(url, env) {
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${env.GH_TOKEN}`,
+      Accept: "application/vnd.github.raw+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "bounty-discovery-worker",
+    },
+  });
+  return res.ok ? res.text() : null;
+}
+
+async function buildBrief(env, it, repo, amount, ai) {
+  const [contrib, comments, root] = await Promise.all([
+    (async () => {
+      for (const p of ["CONTRIBUTING.md", ".github/CONTRIBUTING.md", "AGENTS.md"]) {
+        const t = await ghText(`https://api.github.com/repos/${repo}/contents/${p}`, env);
+        if (t) return `(${p})\n${t.slice(0, 3500)}`;
+      }
+      return null;
+    })(),
+    (async () => {
+      const res = await ghFetch(`${it.comments_url}?per_page=15`, env);
+      if (!res.ok) return [];
+      const list = await res.json();
+      return list
+        .filter((c) => !/bot|bountyhub|github-actions/i.test(c.user?.login || ""))
+        .map((c) => `@${c.user?.login}: ${(c.body || "").slice(0, 1200)}`);
+    })().catch(() => []),
+    (async () => {
+      const res = await ghFetch(`https://api.github.com/repos/${repo}/contents/`, env);
+      if (!res.ok) return [];
+      const list = await res.json();
+      return Array.isArray(list) ? list.map((f) => (f.type === "dir" ? `${f.name}/` : f.name)) : [];
+    })().catch(() => []),
+  ]);
+
+  const labels = (it.labels || []).map((l) => l.name).join(", ");
+  return `# Bounty brief: ${it.title}
+
+- Repo: ${repo}  (https://github.com/${repo})
+- Issue: ${it.html_url}
+- Amount: ${amount || "not found"}
+- Labels: ${labels || "none"}
+${ai ? `- AI fit: ${ai.score}/10 (~${ai.effort_hours}h) - ${ai.reason}\n- AI policy in issue text: ${ai.ai_policy}\n` : ""}
+## Issue description (the maintainer's requirements)
+
+${(it.body || "(empty)").slice(0, 8000)}
+
+## Discussion on the issue
+
+${comments.length ? comments.join("\n\n---\n\n") : "(no human comments yet)"}
+
+## Contributing rules
+
+${contrib || "(no CONTRIBUTING.md / AGENTS.md found - read the README and recent merged PRs before you start)"}
+
+## Repo root
+
+${root.length ? root.join("  ") : "(unavailable)"}
+
+---
+
+## Prompt to paste into claude.ai
+
+I am working on a paid open-source bounty. Help me solve it properly.
+Repo: ${repo}
+Issue: ${it.html_url}
+
+1. Restate the maintainer's requirements as a numbered checklist, including anything implied by the discussion.
+2. Tell me exactly which files I should paste so you can work on them.
+3. After I paste them, propose a minimal patch that follows the repo's conventions, plus tests, and explain every change so I can understand and adapt it.
+4. Do not invent APIs or files. Ask me if something is unclear.
+
+(Paste this whole file into claude.ai: the issue text and repo rules are above.)
+
+---
+
+## Before you open the PR
+
+- [ ] Read the issue, the comments and CONTRIBUTING again; every requirement is covered
+- [ ] Nobody else has an open PR for this issue (check the issue page and the PR list)
+- [ ] You understand every line of the change and could explain it
+- [ ] Repo's tests/lint/build pass locally; new tests added where it makes sense
+- [ ] For UI changes: screenshots (before/after) attached to the PR
+- [ ] PR links the issue ("Closes #${it.number}") and says that AI tools helped, if the project asks for it
+- [ ] If the bounty platform needs a claim or comment first (BountyHub, Algora), do it
+
+## PR description template
+
+### What
+<one or two sentences>
+
+### Why
+Closes #${it.number}
+
+### How I tested
+<commands and results, screenshots>
+
+### Notes
+<trade-offs, follow-ups; say that AI tools were used for assistance and that you reviewed the change>
+`;
+}
+
+async function sendDocument(env, filename, content, caption) {
+  const form = new FormData();
+  form.append("chat_id", String(env.TELEGRAM_CHAT_ID));
+  form.append("caption", caption.slice(0, 1000));
+  form.append("document", new Blob([content], { type: "text/markdown" }), filename);
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) throw new Error(`Telegram sendDocument ${res.status}`);
 }
 
 // ---------------------------------------------------------------- GitHub
