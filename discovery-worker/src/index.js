@@ -25,8 +25,13 @@ export default {
     ctx.waitUntil(poll(env));
   },
 
-  // Health check: how many bounties have been seen.
-  async fetch(_req, env) {
+  async fetch(req, env) {
+    const u = new URL(req.url);
+
+    // Debug: one tiny OpenRouter call to check the key / model / credits.
+    if (u.pathname === "/debug/ai") return debugAi(env);
+
+    // Health check: how many bounties have been seen.
     const row = await env.DB.prepare(
       "SELECT COUNT(*) AS total, SUM(notified) AS alerted, MAX(first_seen) AS last_seen FROM seen"
     ).first();
@@ -66,6 +71,7 @@ async function poll(env) {
 
       // ---- AI feasibility filter (skipped if no OPENROUTER_API_KEY) ----
       let ai = null;
+      let aiErr = "";
       if (env.OPENROUTER_API_KEY) {
         if (aiCalls >= MAX_AI_CALLS_PER_RUN) {
           // too many this minute: forget it so the next run triages it
@@ -73,7 +79,9 @@ async function poll(env) {
           continue;
         }
         aiCalls++;
-        ai = await aiTriage(env, it, repo);
+        const res = await aiTriage(env, it, repo);
+        if (res && !res.error) ai = res;
+        else aiErr = res?.error || "unreadable reply";
         if (ai) {
           await env.DB.prepare("UPDATE seen SET ai_score = ?, ai_reason = ? WHERE issue_id = ?")
             .bind(ai.score, ai.reason, it.id).run();
@@ -99,7 +107,7 @@ async function poll(env) {
         "✅ No linked PR yet",
         ai
           ? `🤖 AI fit: ${ai.score}/10 (~${ai.effort_hours}h) - ${ai.reason}`
-          : env.OPENROUTER_API_KEY ? "🤖 AI fit: check unavailable" : "",
+          : env.OPENROUTER_API_KEY ? `🤖 AI fit: check unavailable (${aiErr.slice(0, 120)})` : "",
         ai && ai.ai_policy === "unknown" ? "" : ai ? `📜 AI policy: ${ai.ai_policy}` : "",
         `🕐 Created: ${it.created_at}`,
       ].filter(Boolean).join("\n");
@@ -168,12 +176,34 @@ async function aiTriage(env, it, repo) {
       }),
       signal: AbortSignal.timeout(25000),
     });
-    if (!res.ok) throw new Error(`OpenRouter ${res.status}`);
+    if (!res.ok) {
+      const body = (await res.text()).replace(/\s+/g, " ").slice(0, 160);
+      throw new Error(`OpenRouter ${res.status}: ${body}`);
+    }
     const data = await res.json();
-    return parseTriage(data?.choices?.[0]?.message?.content || "");
+    return parseTriage(data?.choices?.[0]?.message?.content || "") || { error: "unreadable reply" };
   } catch (e) {
     console.error(`ai triage failed: ${e.message}`);
-    return null; // fail open: alert anyway
+    return { error: e.message }; // fail open: alert anyway
+  }
+}
+
+async function debugAi(env) {
+  if (!env.OPENROUTER_API_KEY) {
+    return Response.json({ ok: false, error: "OPENROUTER_API_KEY secret is not set on the worker" }, { status: 500 });
+  }
+  const model = env.TRIAGE_MODEL || "anthropic/claude-sonnet-4.5";
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, max_tokens: 20, messages: [{ role: "user", content: "Reply with the single word OK" }] }),
+      signal: AbortSignal.timeout(25000),
+    });
+    const text = await res.text();
+    return Response.json({ ok: res.ok, status: res.status, model, reply: text.slice(0, 400) }, { status: res.ok ? 200 : 502 });
+  } catch (e) {
+    return Response.json({ ok: false, model, error: e.message }, { status: 502 });
   }
 }
 
