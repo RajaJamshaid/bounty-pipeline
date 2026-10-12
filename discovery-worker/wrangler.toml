@@ -14,4 +14,5 @@ database_id = "5b94bed2-1ce3-4a54-a7c7-55491645019b"
 MAX_AGE_HOURS = "12"
 # AI feasibility filter: only alert when the model scores the issue >= MIN_AI_SCORE (0-10)
 MIN_AI_SCORE = "6"
-TRIAGE_MODEL = "anthropic/claude-sonnet-4.5"
+# Free models (no credits needed). Comma-separated: the next one is tried if one fails.
+TRIAGE_MODEL = "openai/gpt-oss-120b:free,openrouter/free"

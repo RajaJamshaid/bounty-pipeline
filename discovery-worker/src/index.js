@@ -29,7 +29,7 @@ export default {
   async fetch(req, env) {
     const u = new URL(req.url);
 
-    // Debug: one tiny OpenRouter call to check the key / model / credits.
+    // Debug: one tiny OpenRouter call per triage model to check key / model / credits.
     if (u.pathname === "/debug/ai") return debugAi(env);
 
     // Health check: how many bounties have been seen.
@@ -166,6 +166,25 @@ Also report the maintainers' stance on AI-written code if the issue text states 
 Reply with ONLY a JSON object:
 {"score": <0-10 integer>, "effort_hours": <number>, "verdict": "solvable"|"borderline"|"skip", "ai_policy": "forbids"|"allows"|"unknown", "reason": "<max 140 chars>"}`;
 
+// TRIAGE_MODEL may be a comma-separated list; the next one is tried when a model fails.
+function triageModels(env) {
+  return (env.TRIAGE_MODEL || "openai/gpt-oss-120b:free,openrouter/free")
+    .split(",").map((m) => m.trim()).filter(Boolean);
+}
+
+async function openRouter(env, model, body) {
+  return fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    // reasoning models spend part of max_tokens on thinking, so keep it generous
+    body: JSON.stringify({ model, temperature: 0, reasoning: { effort: "low" }, ...body }),
+    signal: AbortSignal.timeout(25000),
+  });
+}
+
 async function aiTriage(env, it, repo) {
   const labels = (it.labels || []).map((l) => l.name).join(", ");
   const user = [
@@ -178,53 +197,52 @@ async function aiTriage(env, it, repo) {
     (it.body || "(empty)").slice(0, 6000),
   ].join("\n");
 
-  try {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: env.TRIAGE_MODEL || "anthropic/claude-sonnet-4.5",
-        temperature: 0,
-        max_tokens: 300,
+  let lastErr = "no model configured";
+  for (const model of triageModels(env)) {
+    try {
+      const res = await openRouter(env, model, {
+        max_tokens: 1500,
         messages: [
           { role: "system", content: TRIAGE_SYSTEM },
           { role: "user", content: user },
         ],
-      }),
-      signal: AbortSignal.timeout(25000),
-    });
-    if (!res.ok) {
-      const body = (await res.text()).replace(/\s+/g, " ").slice(0, 160);
-      throw new Error(`OpenRouter ${res.status}: ${body}`);
+      });
+      if (!res.ok) {
+        const body = (await res.text()).replace(/\s+/g, " ").slice(0, 120);
+        lastErr = `${model}: OpenRouter ${res.status}: ${body}`;
+        continue;
+      }
+      const data = await res.json();
+      const parsed = parseTriage(data?.choices?.[0]?.message?.content || "");
+      if (parsed) return parsed;
+      lastErr = `${model}: unreadable reply`;
+    } catch (e) {
+      lastErr = `${model}: ${e.message}`;
     }
-    const data = await res.json();
-    return parseTriage(data?.choices?.[0]?.message?.content || "") || { error: "unreadable reply" };
-  } catch (e) {
-    console.error(`ai triage failed: ${e.message}`);
-    return { error: e.message }; // fail open: alert anyway
   }
+  console.error(`ai triage failed: ${lastErr}`);
+  return { error: lastErr }; // fail open: alert anyway
 }
 
 async function debugAi(env) {
   if (!env.OPENROUTER_API_KEY) {
     return Response.json({ ok: false, error: "OPENROUTER_API_KEY secret is not set on the worker" }, { status: 500 });
   }
-  const model = env.TRIAGE_MODEL || "anthropic/claude-sonnet-4.5";
-  try {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, max_tokens: 20, messages: [{ role: "user", content: "Reply with the single word OK" }] }),
-      signal: AbortSignal.timeout(25000),
-    });
-    const text = await res.text();
-    return Response.json({ ok: res.ok, status: res.status, model, reply: text.slice(0, 400) }, { status: res.ok ? 200 : 502 });
-  } catch (e) {
-    return Response.json({ ok: false, model, error: e.message }, { status: 502 });
+  const results = [];
+  for (const model of triageModels(env)) {
+    try {
+      const res = await openRouter(env, model, {
+        max_tokens: 300,
+        messages: [{ role: "user", content: "Reply with the single word OK" }],
+      });
+      const text = await res.text();
+      results.push({ model, ok: res.ok, status: res.status, reply: text.slice(0, 300) });
+    } catch (e) {
+      results.push({ model, ok: false, error: e.message });
+    }
   }
+  const ok = results.some((r) => r.ok);
+  return Response.json({ ok, results }, { status: ok ? 200 : 502 });
 }
 
 function parseTriage(text) {
