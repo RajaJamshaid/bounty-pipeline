@@ -1,8 +1,8 @@
 // 24/7 bounty discovery. Runs every minute (Cloudflare cron).
 // Searches GitHub for open, unassigned issues that carry a bounty and have no
-// linked pull request yet, keeps only small bounties (default $10-$30), asks an
-// LLM whether the coding agent can solve each one, dedupes in D1 and alerts
-// Telegram only for the ones worth a look.
+// linked pull request yet, keeps only the kinds of work the coding agent is good
+// at (language / keyword / size rules below; the bounty amount does not matter),
+// asks an LLM to double-check, dedupes in D1 and alerts Telegram.
 //
 // Sources (all via GitHub search):
 //   - issues labelled "💎 Bounty" (Algora), "bounty", "bounties"
@@ -17,6 +17,28 @@ const SOURCES = [
   // be long after the issue itself was opened, so we watch recent activity.
   { name: "BountyHub", sort: "updated", ageField: "updated_at", q: '"BountyHub" "Bounty Alert" in:comments state:open is:issue no:assignee -linked:pr' },
 ];
+
+// ---- What the coding agent is good at (edit these lists to taste) ----
+// Repo primary language must be one of these (docs-only issues pass in any repo).
+const ALLOWED_LANGS = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "SCSS", "Vue", "Markdown"];
+// Matches are shown in the alert; they do not decide anything on their own.
+const POSITIVE_KEYWORDS = [
+  "frontend", "front-end", "ui", "tailwind", "component", "components", "redesign",
+  "bug", "fix", "error", "script", "automation",
+  "test", "tests", "unit test", "coverage", "refactor",
+  "documentation", "docs", "readme", "typo",
+  "react", "vue", "fastify", "flask", "fastapi", "pytest", "jest",
+];
+// Out of scope: heavy DB migrations / Prisma schemas, "build everything from scratch".
+const NEGATIVE_PATTERNS = [
+  /\bprisma\b/i,
+  /\b(db|database|sql)[ -]migrations?\b/i,
+  /\bmigrations?\b.{0,40}\b(database|postgres|mysql|sql)\b/i,
+  /\bfrom scratch\b/i,
+  /\bfull[- ]?stack\b.{0,30}\b(saas|platform|app|application)\b/i,
+  /\b(entire|whole|complete) (platform|system|saas)\b/i,
+];
+const DOCS_RE = /\b(docs?|documentation|readme|typo|typos|spelling|changelog)\b/i;
 
 const MAX_ALERTS_PER_RUN = 10;
 const MAX_AI_CALLS_PER_RUN = 6;
@@ -44,9 +66,11 @@ export default {
 async function poll(env) {
   const maxAgeMs = Number(env.MAX_AGE_HOURS || 6) * 3600 * 1000;
   const minScore = Number(env.MIN_AI_SCORE || 6);
-  const minUsd = Number(env.MIN_BOUNTY_USD || 10);
-  const maxUsd = Number(env.MAX_BOUNTY_USD || 30);
-  const allowUnknown = String(env.ALERT_UNKNOWN_AMOUNT || "false") === "true";
+  const minUsd = Number(env.MIN_BOUNTY_USD || 0);
+  const maxUsd = Number(env.MAX_BOUNTY_USD || 1e9);
+  const allowUnknown = String(env.ALERT_UNKNOWN_AMOUNT || "true") === "true";
+  const maxFiles = Number(env.MAX_FILES || 12);
+  const repoCache = new Map();
   let alerts = 0;
   let aiCalls = 0;
   let briefs = 0;
@@ -75,7 +99,15 @@ async function poll(env) {
       const fresh = Date.now() - Date.parse(it[src.ageField]) <= maxAgeMs;
       if (!fresh || alerts >= MAX_ALERTS_PER_RUN) continue; // old backlog: store silently
 
-      // ---- Bounty size filter (default: $10 - $30) ----
+      // ---- Category filter: language, scope, keywords ----
+      const info = await repoInfo(repo, env, repoCache);
+      const gate = categoryGate(it, info);
+      if (!gate.ok) {
+        await env.DB.prepare("UPDATE seen SET ai_reason = ? WHERE issue_id = ?").bind(`skip: ${gate.why}`, it.id).run();
+        continue;
+      }
+
+      // ---- Bounty amount (shown in the alert; range is optional, see vars) ----
       const amount = await findAmount(it, env);
       if (amount) {
         await env.DB.prepare("UPDATE seen SET amount = ? WHERE issue_id = ?").bind(amount, it.id).run();
@@ -100,6 +132,7 @@ async function poll(env) {
           await env.DB.prepare("UPDATE seen SET ai_score = ?, ai_reason = ? WHERE issue_id = ?")
             .bind(ai.score, ai.reason, it.id).run();
           if (ai.score < minScore || ai.verdict === "skip" || ai.ai_policy === "forbids") continue; // not a fit
+          if (ai.est_files !== null && ai.est_files > maxFiles) continue; // too many files to change
         }
       }
 
@@ -109,12 +142,14 @@ async function poll(env) {
         "",
         `📌 ${it.title}`,
         `📦 ${repo} #${it.number}`,
-        `💰 ${amount || "amount not found"}`,
+        `💰 ${amount || "amount not found - check before you start"}`,
+        gate.language ? `🧩 Language: ${gate.language}` : "",
+        gate.matched.length ? `🎯 Match: ${gate.matched.join(", ")}` : "",
         labels ? `🏷 ${labels}` : "",
         `💬 Comments: ${it.comments}`,
         "✅ No linked PR yet",
         ai
-          ? `🤖 AI fit: ${ai.score}/10 (~${ai.effort_hours}h) - ${ai.reason}`
+          ? `🤖 AI fit: ${ai.score}/10 (~${ai.effort_hours}h${ai.est_files !== null ? `, ~${ai.est_files} files` : ""}) - ${ai.reason}`
           : env.OPENROUTER_API_KEY ? `🤖 AI fit: check unavailable (${aiErr.slice(0, 120)})` : "",
         ai && ai.ai_policy === "unknown" ? "" : ai ? `📜 AI policy: ${ai.ai_policy}` : "",
         `🕐 Created: ${it.created_at}`,
@@ -161,6 +196,12 @@ The agent is a Claude model with a checkout of the repository, a shell and the r
 It cannot use a browser or GUI, has no accounts, credentials, hardware, wallets or private services,
 and cannot talk to the maintainers. A human reviews and edits every result before a PR is sent.
 
+The agent works best on: Python, JavaScript, TypeScript, HTML/CSS, Markdown; React, Vue, Tailwind,
+Fastify, Flask, FastAPI, Pytest, Jest; bug fixes, UI/frontend work, scripts and automation, tests,
+refactors, docs. Single-file or small multi-file changes are ideal. Rate LOW (0-3) anything that needs
+more than about 12 files, a full-stack build from scratch, a large architecture change, heavy database
+migrations (SQL, Prisma schemas), or low-level code (Rust, C, C++, Go).
+
 Rate how likely the agent is to produce a correct, mergeable, reviewable solution:
 - 9-10: small, clear, testable (bug fix, small feature, docs, tests, refactor with clear spec).
 - 6-8: moderate size or needs some judgement, but requirements are clear enough.
@@ -170,7 +211,7 @@ Also report the maintainers' stance on AI-written code if the issue text states 
 "forbids" (explicitly no AI-generated code), "allows" (explicitly fine), otherwise "unknown".
 
 Reply with ONLY a JSON object:
-{"score": <0-10 integer>, "effort_hours": <number>, "verdict": "solvable"|"borderline"|"skip", "ai_policy": "forbids"|"allows"|"unknown", "reason": "<max 140 chars>"}`;
+{"score": <0-10 integer>, "effort_hours": <number>, "est_files": <integer, files likely to change>, "verdict": "solvable"|"borderline"|"skip", "ai_policy": "forbids"|"allows"|"unknown", "reason": "<max 140 chars>"}`;
 
 // TRIAGE_MODEL may be a comma-separated list; the next one is tried when a model fails.
 function triageModels(env) {
@@ -261,6 +302,7 @@ function parseTriage(text) {
     return {
       score: Math.max(0, Math.min(10, score)),
       effort_hours: Number.isFinite(Number(o.effort_hours)) ? Number(o.effort_hours) : "?",
+      est_files: Number.isFinite(Number(o.est_files)) && o.est_files !== null ? Math.round(Number(o.est_files)) : null,
       verdict: ["solvable", "borderline", "skip"].includes(o.verdict) ? o.verdict : "borderline",
       ai_policy: ["forbids", "allows", "unknown"].includes(o.ai_policy) ? o.ai_policy : "unknown",
       reason: String(o.reason || "").slice(0, 160),
@@ -268,6 +310,43 @@ function parseTriage(text) {
   } catch (_e) {
     return null;
   }
+}
+
+// ------------------------------------------------------------ Category filter
+async function repoInfo(repo, env, cache) {
+  if (cache.has(repo)) return cache.get(repo);
+  let info = { language: null, topics: [], archived: false };
+  try {
+    const res = await ghFetch(`https://api.github.com/repos/${repo}`, env);
+    if (res.ok) {
+      const r = await res.json();
+      info = { language: r.language || null, topics: r.topics || [], archived: Boolean(r.archived) };
+    }
+  } catch (_e) {
+    // unknown language: only docs-only issues will pass
+  }
+  cache.set(repo, info);
+  return info;
+}
+
+function categoryGate(it, info) {
+  const head = `${(it.labels || []).map((l) => l.name).join(" ")} ${it.title}`;
+  const body = (it.body || "").slice(0, 3000);
+  const topics = info.topics.join(" ");
+
+  if (info.archived) return { ok: false, why: "repo archived" };
+  for (const re of NEGATIVE_PATTERNS) {
+    if (re.test(`${head} ${body}`)) return { ok: false, why: `out of scope (${re.source.slice(0, 30)})` };
+  }
+  const docsOnly = DOCS_RE.test(head);
+  const langOk = Boolean(info.language) && ALLOWED_LANGS.includes(info.language);
+  if (!langOk && !docsOnly) return { ok: false, why: `language ${info.language || "unknown"}` };
+
+  const hay = `${head} ${topics} ${body.slice(0, 1500)}`;
+  const matched = POSITIVE_KEYWORDS.filter((k) =>
+    new RegExp(`\\b${k.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`, "i").test(hay)
+  );
+  return { ok: true, language: info.language, matched: matched.slice(0, 6) };
 }
 
 // ------------------------------------------------------------ Brief
