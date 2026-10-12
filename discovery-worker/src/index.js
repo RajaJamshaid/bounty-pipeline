@@ -1,8 +1,9 @@
 // 24/7 bounty discovery. Runs every minute (Cloudflare cron).
 // Searches GitHub for open, unassigned issues that carry a bounty and have no
-// linked pull request yet, keeps only the kinds of work the coding agent is good
-// at (language / keyword / size rules below; the bounty amount does not matter),
-// asks an LLM to double-check, dedupes in D1 and alerts Telegram.
+// linked pull request yet, keeps only real-money bounties (a $ amount from a bounty
+// bot or a real project) in the kinds of work the coding agent is good at (language /
+// keyword / size rules below; the bounty amount itself does not matter), asks an LLM
+// to double-check, dedupes in D1 and alerts Telegram.
 //
 // Sources (all via GitHub search):
 //   - issues labelled "💎 Bounty" (Algora), "bounty", "bounties"
@@ -20,7 +21,10 @@ const SOURCES = [
 
 // ---- What the coding agent is good at (edit these lists to taste) ----
 // Repo primary language must be one of these (docs-only issues pass in any repo).
-const ALLOWED_LANGS = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "SCSS", "Vue", "Markdown"];
+const ALLOWED_LANGS = [
+  "Python", "JavaScript", "TypeScript", "HTML", "CSS", "SCSS", "Vue", "Markdown",
+  "Java", "C#", "PHP", "Ruby", "Kotlin",
+];
 // Matches are shown in the alert; they do not decide anything on their own.
 const POSITIVE_KEYWORDS = [
   "frontend", "front-end", "ui", "tailwind", "component", "components", "redesign",
@@ -38,6 +42,9 @@ const NEGATIVE_PATTERNS = [
   /\bfull[- ]?stack\b.{0,30}\b(saas|platform|app|application)\b/i,
   /\b(entire|whole|complete) (platform|system|saas)\b/i,
 ];
+// Bounty-farming / spam: repos named after bounties, bot digests, "donate" posts.
+const SPAM_REPO_RE = /bount(y|ies)|radar|airdrop|giveaway|plaza/i;
+const SPAM_TITLE_RE = /^\s*\[(radar|audit-test)\]|\b(donat(e|ion)s?|airdrops?|giveaways?)\b/i;
 const DOCS_RE = /\b(docs?|documentation|readme|typo|typos|spelling|changelog)\b/i;
 
 const MAX_ALERTS_PER_RUN = 10;
@@ -68,7 +75,8 @@ async function poll(env) {
   const minScore = Number(env.MIN_AI_SCORE || 6);
   const minUsd = Number(env.MIN_BOUNTY_USD || 0);
   const maxUsd = Number(env.MAX_BOUNTY_USD || 1e9);
-  const allowUnknown = String(env.ALERT_UNKNOWN_AMOUNT || "true") === "true";
+  const allowUnknown = String(env.ALERT_UNKNOWN_AMOUNT || "false") === "true";
+  const minStars = Number(env.MIN_REPO_STARS || 10);
   const maxFiles = Number(env.MAX_FILES || 12);
   const repoCache = new Map();
   let alerts = 0;
@@ -99,7 +107,7 @@ async function poll(env) {
       const fresh = Date.now() - Date.parse(it[src.ageField]) <= maxAgeMs;
       if (!fresh || alerts >= MAX_ALERTS_PER_RUN) continue; // old backlog: store silently
 
-      // ---- Category filter: language, scope, keywords ----
+      // ---- Category filter: language, scope, spam ----
       const info = await repoInfo(repo, env, repoCache);
       const gate = categoryGate(it, info);
       if (!gate.ok) {
@@ -107,13 +115,25 @@ async function poll(env) {
         continue;
       }
 
-      // ---- Bounty amount (shown in the alert; range is optional, see vars) ----
-      const amount = await findAmount(it, env);
+      // ---- Real money? Needs a $ amount (any size) from a trusted source ----
+      const found = await findAmount(it, env);
+      const amount = found.amount;
       if (amount) {
         await env.DB.prepare("UPDATE seen SET amount = ? WHERE issue_id = ?").bind(amount, it.id).run();
       }
       const usd = parseUsd(amount);
-      if (usd === null ? !allowUnknown : usd < minUsd || usd > maxUsd) continue; // wrong size
+      if (usd === null ? !allowUnknown : usd < minUsd || usd > maxUsd) {
+        await env.DB.prepare("UPDATE seen SET ai_reason = ? WHERE issue_id = ?")
+          .bind(usd === null ? "skip: no $ amount found" : `skip: amount ${amount} outside range`, it.id).run();
+        continue;
+      }
+      // Trusted = a bounty platform's bot confirmed it, or the repo is a real project (stars).
+      const trusted = found.via === "bot" || src.name === "BountyHub" || info.stars >= minStars;
+      if (!trusted) {
+        await env.DB.prepare("UPDATE seen SET ai_reason = ? WHERE issue_id = ?")
+          .bind(`skip: unverified bounty, repo has ${info.stars} stars`, it.id).run();
+        continue;
+      }
 
       // ---- AI feasibility filter (skipped if no OPENROUTER_API_KEY) ----
       let ai = null;
@@ -142,7 +162,7 @@ async function poll(env) {
         "",
         `📌 ${it.title}`,
         `📦 ${repo} #${it.number}`,
-        `💰 ${amount || "amount not found - check before you start"}`,
+        `💰 ${amount || "amount not found - check before you start"}${found.via === "bot" ? " (confirmed by bounty bot)" : found.via ? ` (from ${found.via})` : ""}`,
         gate.language ? `🧩 Language: ${gate.language}` : "",
         gate.matched.length ? `🎯 Match: ${gate.matched.join(", ")}` : "",
         labels ? `🏷 ${labels}` : "",
@@ -361,12 +381,12 @@ function parseTriage(text) {
 // ------------------------------------------------------------ Category filter
 async function repoInfo(repo, env, cache) {
   if (cache.has(repo)) return cache.get(repo);
-  let info = { language: null, topics: [], archived: false };
+  let info = { language: null, topics: [], archived: false, stars: 0 };
   try {
     const res = await ghFetch(`https://api.github.com/repos/${repo}`, env);
     if (res.ok) {
       const r = await res.json();
-      info = { language: r.language || null, topics: r.topics || [], archived: Boolean(r.archived) };
+      info = { language: r.language || null, topics: r.topics || [], archived: Boolean(r.archived), stars: r.stargazers_count || 0 };
     }
   } catch (_e) {
     // unknown language: only docs-only issues will pass
@@ -381,6 +401,9 @@ function categoryGate(it, info) {
   const topics = info.topics.join(" ");
 
   if (info.archived) return { ok: false, why: "repo archived" };
+  if (SPAM_REPO_RE.test(it.repository_url.split("/repos/")[1] || "") || SPAM_TITLE_RE.test(it.title)) {
+    return { ok: false, why: "looks like bounty spam / bot digest" };
+  }
   for (const re of NEGATIVE_PATTERNS) {
     if (re.test(`${head} ${body}`)) return { ok: false, why: `out of scope (${re.source.slice(0, 30)})` };
   }
@@ -546,12 +569,14 @@ function firstAmount(text) {
 
 // Most reliable first: labels/title, then the bounty bots' comments (BountyHub,
 // Algora, ...), then the issue body (least reliable: may mention other prices).
+// `via` says where the amount came from: "label", "bot" or "body".
 async function findAmount(it, env) {
   const fromLabels = firstAmount(`${(it.labels || []).map((l) => l.name).join(" ")} ${it.title}`);
-  if (fromLabels) return fromLabels;
+  if (fromLabels) return { amount: fromLabels, via: "label" };
   const fromBot = await botAmount(it, env);
-  if (fromBot) return fromBot;
-  return firstAmount((it.body || "").slice(0, 2000));
+  if (fromBot) return { amount: fromBot, via: "bot" };
+  const fromBody = firstAmount((it.body || "").slice(0, 2000));
+  return { amount: fromBody, via: fromBody ? "body" : null };
 }
 
 // BountyHub writes "A bounty of $10.00 has been created ..."; Algora "💎 $50 bounty".
