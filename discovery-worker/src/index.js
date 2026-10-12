@@ -1,7 +1,8 @@
 // 24/7 bounty discovery. Runs every minute (Cloudflare cron).
 // Searches GitHub for open, unassigned issues that carry a bounty and have no
-// linked pull request yet, asks an LLM whether the coding agent can solve each
-// one, dedupes in D1 and alerts Telegram only for the ones worth a look.
+// linked pull request yet, keeps only small bounties (default $10-$30), asks an
+// LLM whether the coding agent can solve each one, dedupes in D1 and alerts
+// Telegram only for the ones worth a look.
 //
 // Sources (all via GitHub search):
 //   - issues labelled "💎 Bounty" (Algora), "bounty", "bounties"
@@ -43,6 +44,9 @@ export default {
 async function poll(env) {
   const maxAgeMs = Number(env.MAX_AGE_HOURS || 6) * 3600 * 1000;
   const minScore = Number(env.MIN_AI_SCORE || 6);
+  const minUsd = Number(env.MIN_BOUNTY_USD || 10);
+  const maxUsd = Number(env.MAX_BOUNTY_USD || 30);
+  const allowUnknown = String(env.ALERT_UNKNOWN_AMOUNT || "false") === "true";
   let alerts = 0;
   let aiCalls = 0;
   let briefs = 0;
@@ -71,6 +75,14 @@ async function poll(env) {
       const fresh = Date.now() - Date.parse(it[src.ageField]) <= maxAgeMs;
       if (!fresh || alerts >= MAX_ALERTS_PER_RUN) continue; // old backlog: store silently
 
+      // ---- Bounty size filter (default: $10 - $30) ----
+      const amount = await findAmount(it, env);
+      if (amount) {
+        await env.DB.prepare("UPDATE seen SET amount = ? WHERE issue_id = ?").bind(amount, it.id).run();
+      }
+      const usd = parseUsd(amount);
+      if (usd === null ? !allowUnknown : usd < minUsd || usd > maxUsd) continue; // wrong size
+
       // ---- AI feasibility filter (skipped if no OPENROUTER_API_KEY) ----
       let ai = null;
       let aiErr = "";
@@ -89,12 +101,6 @@ async function poll(env) {
             .bind(ai.score, ai.reason, it.id).run();
           if (ai.score < minScore || ai.verdict === "skip" || ai.ai_policy === "forbids") continue; // not a fit
         }
-      }
-
-      let amount = extractAmount(it);
-      if (!amount && src.name === "BountyHub") amount = await bountyHubAmount(it, env);
-      if (amount) {
-        await env.DB.prepare("UPDATE seen SET amount = ? WHERE issue_id = ?").bind(amount, it.id).run();
       }
 
       const labels = (it.labels || []).map((l) => l.name).slice(0, 6).join(", ");
@@ -401,23 +407,40 @@ async function searchIssues(src, env) {
   return data.items || [];
 }
 
-function extractAmount(it) {
-  const labels = (it.labels || []).map((l) => l.name).join(" ");
-  const text = `${labels} ${it.title} ${(it.body || "").slice(0, 2000)}`;
-  const m = text.match(/\$\s?(\d{1,3}(?:,\d{3})+|\d+)/);
-  return m ? `$${m[1]}` : null;
+// Amount in USD from a string like "$25", "$1,190" or "$10.00". Returns null if none.
+function parseUsd(amount) {
+  if (!amount) return null;
+  const n = Number(String(amount).replace(/[^0-9.]/g, ""));
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// The BountyHub bot writes: "A bounty of $10.00 has been created by ..."
-async function bountyHubAmount(it, env) {
+function firstAmount(text) {
+  const m = (text || "").match(/\$\s?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?/);
+  return m ? `$${Number(m[1].replace(/,/g, "") + (m[2] || ""))}` : null;
+}
+
+// Most reliable first: labels/title, then the bounty bots' comments (BountyHub,
+// Algora, ...), then the issue body (least reliable: may mention other prices).
+async function findAmount(it, env) {
+  const fromLabels = firstAmount(`${(it.labels || []).map((l) => l.name).join(" ")} ${it.title}`);
+  if (fromLabels) return fromLabels;
+  const fromBot = await botAmount(it, env);
+  if (fromBot) return fromBot;
+  return firstAmount((it.body || "").slice(0, 2000));
+}
+
+// BountyHub writes "A bounty of $10.00 has been created ..."; Algora "💎 $50 bounty".
+async function botAmount(it, env) {
+  if (!it.comments) return null; // no comments, so no bot comment either
   try {
     const res = await ghFetch(`${it.comments_url}?per_page=15`, env);
     if (!res.ok) return null;
     const comments = await res.json();
     for (const c of comments) {
-      if (!/bountyhub/i.test(c.user?.login || "")) continue;
-      const m = (c.body || "").match(/bounty of\W*\$\s?([\d,]+(?:\.\d+)?)/i);
-      if (m) return `$${m[1]}`;
+      if (!/bountyhub|algora|opire|polar/i.test(c.user?.login || "")) continue;
+      const m = (c.body || "").match(/bounty of\W*\$\s?([\d,]+(?:\.\d+)?)/i)
+        || (c.body || "").match(/\$\s?([\d,]+(?:\.\d+)?)/);
+      if (m) return `$${Number(m[1].replace(/,/g, ""))}`;
     }
   } catch (_e) {
     // amount is optional
